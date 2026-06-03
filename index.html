@@ -168,12 +168,12 @@
   .quote small {
     display: block;
     padding-left: 30px;
-    margin-top: 6px;
-    color: var(--ink-faint);
-    font-size: 12px;
-    letter-spacing: .06em;
-    text-transform: uppercase;
-    font-weight: 600;
+    margin-top: 8px;
+    color: var(--accent-deep);
+    font-size: 13px;
+    letter-spacing: .02em;
+    font-weight: 700;
+    transition: opacity .4s;
   }
 
   /* ---------- Layout ---------- */
@@ -251,6 +251,7 @@
   ul { list-style: none; }
 
   .task {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 13px;
@@ -262,6 +263,14 @@
   }
   .task:hover { background: rgba(99,102,241,0.05); border-color: var(--line); }
   .task.leaving { opacity: 0; transform: translateX(26px); }
+  .task[draggable="true"] { cursor: grab; }
+  .task.dragging { opacity: .5; cursor: grabbing; }
+  /* small colored stripe = project indication */
+  .task.tagged::before {
+    content: ''; position: absolute; left: 3px; top: 9px; bottom: 9px;
+    width: 4px; border-radius: 4px; background: var(--pc, var(--accent));
+  }
+  .task.tagged { padding-left: 16px; }
 
   @keyframes pop {
     from { opacity: 0; transform: translateY(-6px); }
@@ -303,7 +312,17 @@
   }
   .task:hover .task-del { opacity: 1; }
   .task-del:hover { color: var(--bad); background: rgba(239,68,68,0.1); }
-  @media (hover: none) { .task-del { opacity: .5; } }
+  @media (hover: none) { .task-del, .task-tag { opacity: .55; } }
+
+  .task-tag {
+    opacity: 0;
+    border: none; background: none; cursor: pointer;
+    color: var(--ink-faint); font-size: 16px; line-height: 1;
+    padding: 4px 6px; border-radius: 8px;
+    transition: opacity .2s, color .2s, background .2s;
+  }
+  .task:hover .task-tag { opacity: 1; }
+  .task-tag:hover { color: var(--accent-deep); background: var(--accent-soft); }
 
   .empty {
     text-align: center;
@@ -334,6 +353,27 @@
     transition: box-shadow .2s;
   }
   .project-card:hover { box-shadow: var(--shadow-soft); }
+  body.dnd .project-card { border-style: dashed; border-color: var(--accent); }
+  .project-card.drop-hover {
+    border-color: var(--accent); border-style: solid;
+    background: var(--accent-soft);
+    box-shadow: 0 0 0 4px var(--accent-soft);
+    transform: translateY(-1px);
+  }
+  .new-project-btn {
+    width: 100%; margin-bottom: 14px;
+    border: 1.5px dashed var(--line); background: transparent;
+    color: var(--ink-soft); font-weight: 600; font-size: 14px;
+    border-radius: 14px; padding: 11px; cursor: pointer;
+    transition: border-color .2s, color .2s, background .2s;
+  }
+  .new-project-btn:hover { border-color: var(--accent); color: var(--accent-deep); background: var(--accent-soft); }
+  .project-del {
+    border: none; background: none; cursor: pointer; color: var(--ink-faint);
+    font-size: 15px; padding: 0 4px; border-radius: 6px; opacity: .5;
+  }
+  .project-del:hover { color: var(--bad); background: rgba(239,68,68,0.1); opacity: 1; }
+  .drop-hint { font-size: 12.5px; color: var(--ink-faint); font-style: italic; padding: 6px 2px 2px; }
   .project-head { display: flex; align-items: center; gap: 10px; cursor: pointer; }
   .project-head .dot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
   .project-name { font-weight: 700; font-size: 15px; flex: 1; }
@@ -552,11 +592,34 @@ function load() {
 function save() { localStorage.setItem(KEY, JSON.stringify(state)); }
 function migrate() {
   let changed = false;
+  if (!Array.isArray(state.projects)) { state.projects = []; changed = true; }
   state.tasks.forEach(t => {
     if (!t.updatedAt) { t.updatedAt = t.completedAt || t.createdAt || new Date().toISOString(); changed = true; }
     if (t.deleted === undefined) { t.deleted = false; changed = true; }
   });
   if (changed) save();
+}
+
+/* All project names: explicitly created + derived from tagged tasks */
+function allProjectNames() {
+  const set = new Set(state.projects || []);
+  visibleTasks().forEach(t => { if (t.project) set.add(t.project); });
+  return [...set].sort((a, b) => a.localeCompare(b));
+}
+function ensureProject(name) {
+  name = (name || '').trim();
+  if (!name) return;
+  if (!state.projects.includes(name)) { state.projects.push(name); }
+}
+function assignTaskToProject(taskId, name) {
+  const t = state.tasks.find(x => x.id === taskId);
+  if (!t) return;
+  name = (name || '').trim() || null;
+  if (t.project === name) return;
+  t.project = name;
+  if (name) ensureProject(name);
+  touch(t);
+  save(); render(); scheduleSync();
 }
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 function now() { return new Date().toISOString(); }
@@ -593,6 +656,7 @@ function addTask(text, project) {
   text = text.trim();
   if (!text) return;
   project = (project || '').trim();
+  if (project) ensureProject(project);
   const t = {
     id: uid(), text, project: project || null,
     done: false, createdAt: now(), completedAt: null,
@@ -669,7 +733,22 @@ function render() {
 
 function taskRow(t) {
   const li = document.createElement('li');
-  li.className = 'task' + (t.done ? ' done' : '');
+  li.className = 'task' + (t.done ? ' done' : '') + (t.project ? ' tagged' : '');
+  if (t.project) li.style.setProperty('--pc', projectColor(t.project));
+
+  // drag to a project
+  li.draggable = true;
+  li.addEventListener('dragstart', e => {
+    e.dataTransfer.setData('text/plain', t.id);
+    e.dataTransfer.effectAllowed = 'move';
+    li.classList.add('dragging');
+    document.body.classList.add('dnd');
+  });
+  li.addEventListener('dragend', () => {
+    li.classList.remove('dragging');
+    document.body.classList.remove('dnd');
+    document.querySelectorAll('.project-card.drop-hover').forEach(c => c.classList.remove('drop-hover'));
+  });
 
   const check = document.createElement('button');
   check.className = 'check' + (t.done ? ' done' : '');
@@ -701,56 +780,102 @@ function taskRow(t) {
     body.appendChild(pill);
   }
 
+  const tag = document.createElement('button');
+  tag.className = 'task-tag';
+  tag.innerHTML = '🏷️';
+  tag.title = t.project ? 'Change project' : 'Add to a project';
+  tag.onclick = () => openAssign(t);
+
   const del = document.createElement('button');
   del.className = 'task-del';
   del.innerHTML = '✕';
   del.title = 'Delete';
   del.onclick = () => deleteTask(t.id);
 
-  li.append(check, body, del);
+  li.append(check, body, tag, del);
   return li;
+}
+
+/* tap-to-assign — works on touch devices where drag-and-drop doesn't */
+function openAssign(t) {
+  const names = allProjectNames();
+  const hint = names.length ? '\n\nExisting projects: ' + names.join(', ') : '';
+  const choice = prompt('Assign this task to a project.\nType a name (or leave blank to remove it from any project):' + hint, t.project || '');
+  if (choice !== null) assignTaskToProject(t.id, choice);
 }
 
 const openProjects = new Set();
 
 function renderProjects() {
-  const byProject = {};
-  visibleTasks().forEach(t => {
-    if (!t.project) return;
-    (byProject[t.project] ??= []).push(t);
-  });
-
-  const names = Object.keys(byProject).sort();
+  const names = allProjectNames();
   document.getElementById('project-list').innerHTML =
     names.map(n => `<option value="${escapeHtml(n)}">`).join('');
 
+  projectsEl.innerHTML = '';
+
+  const addBtn = document.createElement('button');
+  addBtn.className = 'new-project-btn';
+  addBtn.innerHTML = '＋ New project';
+  addBtn.onclick = () => {
+    const n = prompt('Name your new project:');
+    if (n && n.trim()) { ensureProject(n.trim()); openProjects.add(n.trim()); save(); render(); scheduleSync(); }
+  };
+  projectsEl.appendChild(addBtn);
+
   if (!names.length) {
-    projectsEl.innerHTML = `<div class="empty"><span class="emoji">🗂️</span>Tag a task with a project and its wins will collect here.</div>`;
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.innerHTML = `<span class="emoji">🗂️</span>Create a project, then drag tasks onto it (or tap 🏷️ on a task).`;
+    projectsEl.appendChild(empty);
     return;
   }
 
-  projectsEl.innerHTML = '';
   names.forEach(name => {
-    const items = byProject[name];
+    const items = visibleTasks().filter(t => t.project === name);
     const done = items.filter(t => t.done);
-    const pct = Math.round(done.length / items.length * 100);
+    const pct = items.length ? Math.round(done.length / items.length * 100) : 0;
     const color = projectColor(name);
     const wasOpen = openProjects.has(name);
 
     const card = document.createElement('div');
     card.className = 'project-card' + (wasOpen ? ' open' : '');
 
+    // drop target for drag-and-drop assignment
+    card.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; card.classList.add('drop-hover'); });
+    card.addEventListener('dragleave', e => { if (!card.contains(e.relatedTarget)) card.classList.remove('drop-hover'); });
+    card.addEventListener('drop', e => {
+      e.preventDefault(); card.classList.remove('drop-hover');
+      const id = e.dataTransfer.getData('text/plain');
+      if (id) { openProjects.add(name); assignTaskToProject(id, name); }
+    });
+
     const head = document.createElement('div');
     head.className = 'project-head';
+    const stat = items.length ? `${done.length}/${items.length} done` : 'empty';
     head.innerHTML = `
       <span class="dot" style="background:${color}"></span>
       <span class="project-name">${escapeHtml(name)}</span>
-      <span class="project-stat">${done.length}/${items.length} done</span>
+      <span class="project-stat">${stat}</span>
       <span class="chevron">▶</span>`;
     head.onclick = () => {
       if (openProjects.has(name)) openProjects.delete(name); else openProjects.add(name);
       card.classList.toggle('open');
     };
+
+    // delete button only for empty projects (avoid orphaning tagged tasks)
+    if (!items.length) {
+      const pdel = document.createElement('button');
+      pdel.className = 'project-del';
+      pdel.innerHTML = '✕';
+      pdel.title = 'Delete project';
+      pdel.onclick = (e) => {
+        e.stopPropagation();
+        state.projects = state.projects.filter(p => p !== name);
+        openProjects.delete(name);
+        save(); render();
+      };
+      head.appendChild(pdel);
+    }
 
     const bar = document.createElement('div');
     bar.className = 'mini-bar';
@@ -758,16 +883,20 @@ function renderProjects() {
 
     const list = document.createElement('div');
     list.className = 'project-tasks';
-    const sorted = [...items].sort((a,b) => (b.done - a.done) || (new Date(b.completedAt||0) - new Date(a.completedAt||0)));
-    sorted.forEach(t => {
-      const row = document.createElement('div');
-      row.className = 'ptask' + (t.done ? '' : ' active-row');
-      row.innerHTML = `
-        <span class="tick">${t.done ? '✓' : '○'}</span>
-        <span class="${t.done ? 'done-txt' : ''}">${escapeHtml(t.text)}</span>
-        ${t.done ? `<span class="when">${relativeDay(t.completedAt)} · ${clockTime(t.completedAt)}</span>` : ''}`;
-      list.appendChild(row);
-    });
+    if (!items.length) {
+      list.innerHTML = `<div class="drop-hint">Drag a task here, or tap 🏷️ on a task to add it.</div>`;
+    } else {
+      const sorted = [...items].sort((a,b) => (b.done - a.done) || (new Date(b.completedAt||0) - new Date(a.completedAt||0)));
+      sorted.forEach(t => {
+        const row = document.createElement('div');
+        row.className = 'ptask' + (t.done ? '' : ' active-row');
+        row.innerHTML = `
+          <span class="tick">${t.done ? '✓' : '○'}</span>
+          <span class="${t.done ? 'done-txt' : ''}">${escapeHtml(t.text)}</span>
+          ${t.done ? `<span class="when">${relativeDay(t.completedAt)} · ${clockTime(t.completedAt)}</span>` : ''}`;
+        list.appendChild(row);
+      });
+    }
 
     card.append(head, bar, list);
     projectsEl.appendChild(card);
@@ -779,14 +908,29 @@ function escapeHtml(s) {
 }
 
 /* ===================== Form ===================== */
-document.getElementById('add-form').addEventListener('submit', e => {
-  e.preventDefault();
-  const ti = document.getElementById('task-input');
-  const pi = document.getElementById('project-input');
-  addTask(ti.value, pi.value);
-  ti.value = '';
-  pi.value = '';
-  ti.focus();
+const taskInput = document.getElementById('task-input');
+const projectInput = document.getElementById('project-input');
+
+function submitAdd() {
+  const text = taskInput.value.trim();
+  const project = projectInput.value.trim();
+  if (text) {
+    addTask(text, project);            // task (optionally tagged to a project)
+    taskInput.value = '';
+    projectInput.value = '';
+    taskInput.focus();
+  } else if (project) {
+    ensureProject(project);            // project only → create an empty project
+    save(); render(); scheduleSync();
+    projectInput.value = '';
+    projectInput.focus();
+  }
+}
+
+document.getElementById('add-form').addEventListener('submit', e => { e.preventDefault(); submitAdd(); });
+// datalist can swallow the first Enter, so submit explicitly from the project field
+projectInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); submitAdd(); }
 });
 
 /* ===================== Greeting + date ===================== */
@@ -811,50 +955,50 @@ nameEl.onclick = () => {
 
 /* ===================== Hourly quotes ===================== */
 const QUOTES = [
-  "Small steps every day add up to big results.",
-  "You don't have to be great to start, but you have to start to be great.",
-  "Progress, not perfection.",
-  "The secret of getting ahead is getting started.",
-  "Focus on being productive instead of busy.",
-  "What you do today can improve all your tomorrows.",
-  "Done is better than perfect.",
-  "Your future is created by what you do today.",
-  "One task at a time. One win at a time.",
-  "Discipline is choosing what you want most over what you want now.",
-  "A little progress each day adds up to big results.",
-  "Start where you are. Use what you have. Do what you can.",
-  "The best way to predict the future is to create it.",
-  "Energy and persistence conquer all things.",
-  "You are capable of amazing things.",
-  "Great things are done by a series of small things brought together.",
-  "Action is the foundational key to all success.",
-  "Today is a fresh start. Make it count.",
-  "Believe you can and you're halfway there.",
-  "Success is the sum of small efforts, repeated day in and day out.",
-  "Don't watch the clock; do what it does — keep going.",
-  "Dream big. Start small. Act now.",
-  "Every accomplishment starts with the decision to try.",
-  "Your only limit is you — be brave and fearless.",
-  "Make today so awesome that yesterday gets jealous.",
-  "The expert in anything was once a beginner.",
-  "Quality is not an act, it is a habit.",
-  "Be the energy you want to attract.",
-  "Little by little, one travels far.",
-  "Fall seven times, stand up eight.",
-  "Well done is better than well said.",
-  "The harder you work for something, the greater you'll feel achieving it.",
-  "Each morning we are born again. What we do today matters most.",
-  "Confidence comes from discipline and training.",
-  "You don't have to see the whole staircase, just take the first step.",
-  "Calm mind brings inner strength and self-confidence."
+  { q: "The only way to do great work is to love what you do.", a: "Steve Jobs" },
+  { q: "Innovation distinguishes between a leader and a follower.", a: "Steve Jobs" },
+  { q: "Your time is limited, so don't waste it living someone else's life.", a: "Steve Jobs" },
+  { q: "It's fine to celebrate success, but it is more important to heed the lessons of failure.", a: "Bill Gates" },
+  { q: "Genius is one percent inspiration and ninety-nine percent perspiration.", a: "Thomas Edison" },
+  { q: "Our greatest weakness lies in giving up. The most certain way to succeed is always to try just one more time.", a: "Thomas Edison" },
+  { q: "Whether you think you can, or you think you can't — you're right.", a: "Henry Ford" },
+  { q: "The way to get started is to quit talking and begin doing.", a: "Walt Disney" },
+  { q: "When something is important enough, you do it even if the odds are not in your favor.", a: "Elon Musk" },
+  { q: "The most dangerous phrase in the language is, 'We've always done it this way.'", a: "Grace Hopper" },
+  { q: "Done is better than perfect.", a: "Sheryl Sandberg" },
+  { q: "Knowing is not enough; we must apply. Willing is not enough; we must do.", a: "Johann Wolfgang von Goethe" },
+  { q: "When we are no longer able to change a situation, we are challenged to change ourselves.", a: "Viktor Frankl" },
+  { q: "Everything can be taken from a man but one thing: to choose one's attitude in any given set of circumstances.", a: "Viktor Frankl" },
+  { q: "Act as if what you do makes a difference. It does.", a: "William James" },
+  { q: "The greatest discovery of my generation is that a human being can alter his life by altering his attitudes of mind.", a: "William James" },
+  { q: "Who looks outside, dreams; who looks inside, awakes.", a: "Carl Jung" },
+  { q: "In any given moment we have two options: to step forward into growth or to step back into safety.", a: "Abraham Maslow" },
+  { q: "The good life is a process, not a state of being. It is a direction, not a destination.", a: "Carl Rogers" },
+  { q: "Becoming is better than being.", a: "Carol Dweck" },
+  { q: "Enthusiasm is common. Endurance is rare.", a: "Angela Duckworth" },
+  { q: "Nothing in life is as important as you think it is, while you are thinking about it.", a: "Daniel Kahneman" },
+  { q: "You have power over your mind — not outside events. Realize this, and you will find strength.", a: "Marcus Aurelius" },
+  { q: "The happiness of your life depends upon the quality of your thoughts.", a: "Marcus Aurelius" },
+  { q: "It is not that we have a short time to live, but that we waste a lot of it.", a: "Seneca" },
+  { q: "Luck is what happens when preparation meets opportunity.", a: "Seneca" },
+  { q: "The journey of a thousand miles begins with a single step.", a: "Lao Tzu" },
+  { q: "It does not matter how slowly you go as long as you do not stop.", a: "Confucius" },
+  { q: "Life can only be understood backwards; but it must be lived forwards.", a: "Søren Kierkegaard" },
+  { q: "He who has a why to live can bear almost any how.", a: "Friedrich Nietzsche" },
+  { q: "Start where you are. Use what you have. Do what you can.", a: "Arthur Ashe" }
 ];
 function dayOfYear(d){ const s=new Date(d.getFullYear(),0,0); return Math.floor((d-s)/864e5); }
 function refreshQuote() {
   const n = new Date();
   const idx = (dayOfYear(n) * 24 + n.getHours()) % QUOTES.length;
   const el = document.getElementById('quote-text');
-  el.style.opacity = 0;
-  setTimeout(() => { el.textContent = QUOTES[idx]; el.style.opacity = 1; }, 250);
+  const sub = document.getElementById('quote-sub');
+  el.style.opacity = 0; sub.style.opacity = 0;
+  setTimeout(() => {
+    el.textContent = QUOTES[idx].q;
+    sub.textContent = '— ' + QUOTES[idx].a;
+    el.style.opacity = 1; sub.style.opacity = 1;
+  }, 250);
 }
 function scheduleHourly() {
   const n = new Date();

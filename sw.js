@@ -1,5 +1,5 @@
 /* Daily Notebook service worker — offline shell cache */
-const CACHE = 'daily-notebook-v3';
+const CACHE = 'daily-notebook-v4';
 const SHELL = [
   './',
   './index.html',
